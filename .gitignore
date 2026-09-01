@@ -1,0 +1,21 @@
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+*.RData
+*.Rhistory
+*.csv
+*.xlsx
+*.xls
+*.zip
+*.tar.gz
+*.log
+.DS_Store
+Thumbs.db
+
+# Optional: ignore local outputs
+output/
+results/
+figures/
+plots/
