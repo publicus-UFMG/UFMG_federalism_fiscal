@@ -1,0 +1,277 @@
+---
+title: "Diagnostic of the Spanish population (INE)"
+author: "Samuel dos Santos Rodrigues"
+execute:
+  dir: project
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    df-print: paged
+    fig-cap-location: top
+    fig-align: center
+    theme: cosmo
+    highlight-style: github
+    smooth-scroll: true
+    anchor-sections: true
+lang: pt-BR
+editor: visual
+---
+
+# Diagnóstico da população espanhola (INE):
+
+```{r}
+
+rm(list = ls())
+if(!require(pacman)) install.packages("pacman")
+pacman::p_load(tidyverse, rio, here, janitor, knitr, kableExtra, scales, rmarkdown)
+
+```
+
+## Parâmetros de alerta
+
+```{r}
+
+LIM_PCT <- 15    # variação anual (%) a partir da qual há suspeita
+LIM_ABS <- 200   # e variação absoluta mínima (pessoas), para ignorar vilarejos minúsculos
+LIM_Z   <- 6     # desvios robustos (MAD) dentro da própria série
+
+```
+
+
+## Leitura
+
+```{r}
+
+uniao <- rio::import(here::here("02.metadata/pop_uniao_es.rds"), trusted = TRUE)
+ccaa <- rio::import(here::here("02.metadata/pop_regional_es.rds"), trusted = TRUE)
+municipios <- rio::import(here::here("02.metadata/pop_local_es.rds"), trusted = TRUE)
+
+anos_cols <- names(municipios)[str_detect(names(municipios), "^\\d{4}$")]
+
+empilha <- function(df, nivel) {
+  df |>
+    select(codigo_ine, nome, all_of(anos_cols)) |>
+    pivot_longer(all_of(anos_cols), names_to = "ano", values_to = "pop") |>
+    mutate(nivel = nivel, ano = as.integer(ano))
+}
+
+base <- bind_rows(
+  empilha(uniao,      "1_uniao"),
+  empilha(ccaa,       "2_ccaa"),
+  empilha(municipios, "3_municipio")
+)
+
+```
+
+# Adicionar funções:
+
+```{r}
+
+smin <- function(x) if (all(is.na(x))) NA_real_ else min(x, na.rm = TRUE)
+smax <- function(x) if (all(is.na(x))) NA_real_ else max(x, na.rm = TRUE)
+
+```
+
+# Observações por nível e ano
+
+```{r}
+
+obs_ano <- base |>
+  group_by(nivel, ano) |>
+  summarise(
+    n_entes   = n_distinct(codigo_ine),
+    n_validos = sum(!is.na(pop)),
+    n_na      = sum(is.na(pop)),
+    n_zero    = sum(pop == 0, na.rm = TRUE),
+    pop_total = sum(pop, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+obs_ano_larga <- obs_ano |>
+  select(nivel, ano, n_validos) |>
+  pivot_wider(names_from = ano, values_from = n_validos)
+
+print(obs_ano_larga)
+
+# municípios por província e ano (detecta buracos regionais):
+
+obs_prov_ano <- base |>
+  filter(nivel == "3_municipio") |>
+  mutate(cod_prov = substr(codigo_ine, 1, 2)) |>
+  group_by(cod_prov, ano) |>
+  summarise(n_validos = sum(!is.na(pop)), .groups = "drop") |>
+  pivot_wider(names_from = ano, values_from = n_validos)
+
+```
+
+## Estatísticas descritivas
+
+```{r}
+
+# cross-section: estatísticas descritivas por ano (todos os entes territoriais):
+
+desc_ano <- base |>
+  group_by(nivel, ano) |>
+  summarise(
+    media   = mean(pop, na.rm = TRUE),
+    mediana = median(pop, na.rm = TRUE),
+    minimo  = smin(pop),
+    p5      = quantile(pop, 0.05, na.rm = TRUE),
+    p95     = quantile(pop, 0.95, na.rm = TRUE),
+    maximo  = smax(pop),
+    desvio  = sd(pop, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# longitudinal: estatísticas descritivas por série (ente territorial)
+desc_serie <- base |>
+  group_by(nivel, codigo_ine, nome) |>
+  summarise(
+    n_obs     = sum(!is.na(pop)),
+    media     = mean(pop, na.rm = TRUE),
+    mediana   = median(pop, na.rm = TRUE),
+    minimo    = smin(pop),
+    maximo    = smax(pop),
+    desvio    = sd(pop, na.rm = TRUE),
+    cv        = desvio / media,                 # coeficiente de variação
+    razao_max_min = maximo / minimo,
+    ano_min   = ano[which.min(pop)][1],
+    ano_max   = ano[which.max(pop)][1],
+    .groups = "drop"
+  )
+
+```
+
+# Variações anuais e detecção de saltos
+
+```{r}
+
+var_anual <- base |>
+  arrange(nivel, codigo_ine, ano) |>
+  group_by(nivel, codigo_ine, nome) |>
+  mutate(
+    pop_ant      = lag(pop),
+    var_abs      = pop - pop_ant,
+    var_pct      = 100 * (pop / pop_ant - 1),
+    var_pct_prox = lead(var_pct),
+    # z robusto dentro da própria série (só com >= 8 variações)
+    z_robusto    = if (sum(!is.na(var_pct)) >= 8 && mad(var_pct, na.rm = TRUE) > 0)
+                     (var_pct - median(var_pct, na.rm = TRUE)) / mad(var_pct, na.rm = TRUE)
+                   else NA_real_
+  ) |>
+  ungroup() |>
+  mutate(
+    flag_salto = abs(var_pct) >= LIM_PCT & abs(var_abs) >= LIM_ABS,
+    flag_z     = !is.na(z_robusto) & abs(z_robusto) >= LIM_Z & abs(var_abs) >= LIM_ABS,
+    # sobe e desce (ou vice-versa) em anos seguidos: típico de erro de dado
+    flag_pico  = abs(var_pct) >= LIM_PCT / 2 & abs(var_pct_prox) >= LIM_PCT / 2 &
+                 sign(var_pct) != sign(var_pct_prox) & abs(var_abs) >= LIM_ABS,
+    flag_zero  = !is.na(pop) & pop == 0 & !is.na(pop_ant) & pop_ant > 0
+  )
+
+alertas <- var_anual |>
+  filter(flag_salto | flag_z | flag_pico | flag_zero) |>
+  arrange(desc(abs(var_pct))) |>
+  select(nivel, codigo_ine, nome, ano, pop_ant, pop, var_abs, var_pct, z_robusto,
+         flag_salto, flag_z, flag_pico, flag_zero)
+
+# alertas por ano: se concentrar em um único ano em muitos entes, é sinal de quebra metodológica, não de erro pontual:
+
+alertas_por_ano <- alertas |>
+  count(nivel, ano, name = "n_alertas") |>
+  arrange(nivel, ano)
+
+dist_var_ano <- var_anual |>
+  filter(!is.na(var_pct)) |>
+  group_by(nivel, ano) |>
+  summarise(
+    media   = mean(var_pct), mediana = median(var_pct),
+    minimo  = min(var_pct),  p1 = quantile(var_pct, 0.01),
+    p99     = quantile(var_pct, 0.99), maximo = max(var_pct),
+    .groups = "drop"
+  )
+
+```
+
+# Checagens de integridade
+
+```{r}
+
+checa_codigos <- municipios |>
+  summarise(
+    n_municipios     = n(),
+    codigos_na       = sum(is.na(codigo_ine)),
+    codigos_duplic   = sum(duplicated(codigo_ine)),
+    codigos_len_dif5 = sum(nchar(codigo_ine) != 5, na.rm = TRUE),
+    nomes_duplic     = sum(duplicated(nome))
+  )
+
+# soma das CCAA vs. total nacional, ano a ano
+
+checa_soma <- tibble(
+  ano       = as.integer(anos_cols),
+  soma_ccaa = colSums(ccaa[anos_cols], na.rm = TRUE),
+  uniao     = as.numeric(uniao[1, anos_cols])
+) |> mutate(diferenca = soma_ccaa - uniao)
+
+# municípios com lacunas (criados / extintos / fundidos)
+
+muni_lacunas <- desc_serie |>
+  filter(nivel == "3_municipio", n_obs < length(anos_cols)) |>
+  arrange(n_obs)
+
+# municípios com maior amplitude relativa
+
+muni_amplitude <- desc_serie |>
+  filter(nivel == "3_municipio", n_obs == length(anos_cols)) |>
+  arrange(desc(razao_max_min)) |>
+  slice_head(n = 50)
+
+```
+
+# Gráfico: distribuição das variações anuais
+
+```{r}
+
+g <- var_anual |>
+  filter(nivel == "3_municipio", !is.na(var_pct)) |>
+  ggplot(aes(x = factor(ano), y = var_pct)) +
+  geom_boxplot(outlier.alpha = 0.2, outlier.size = 0.6) +
+  coord_cartesian(ylim = c(-25, 25)) +
+  labs(x = "Ano", y = "Variação anual (%)",
+       title = "Variação anual da população dos municípios (Espanha)") +
+  theme_minimal()
+print(g)
+
+# Resumo e exportação:
+
+message("\nAlertas totais: ", nrow(alertas))
+print(alertas_por_ano)
+print(checa_codigos)
+print(checa_soma)
+
+export(
+  list(
+    obs_por_ano        = obs_ano,
+    obs_por_ano_larga  = obs_ano_larga,
+    obs_prov_ano       = obs_prov_ano,
+    desc_por_ano       = desc_ano,
+    desc_por_serie     = desc_serie,
+    dist_var_anual     = dist_var_ano,
+    alertas            = alertas,
+    alertas_por_ano    = alertas_por_ano,
+    checa_codigos      = checa_codigos,
+    checa_soma_ccaa    = checa_soma,
+    muni_lacunas       = muni_lacunas,
+    muni_amplitude     = muni_amplitude
+  ),
+  "03.output/diagnostic_pop_es.xlsx"
+)
+
+```
